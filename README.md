@@ -94,6 +94,59 @@ This extension does not have any opinion on which tags imply features are lines 
 
 It's important to understand that closed ways which are not tagged `area=yes` or `area=no` are fundamentally ambiguous; the correct interpretation has to be guessed based on the way's other tags. **This extension will emit these ways twice**, once with `kind = 'line'` and a LineString geometry, and once as `kind = 'area'` and a Polygon geometry. It's up to you to filter the results with a WHERE clause to get the interpretation you want.
 
+## Pushdown and performance
+
+The extension reads the file sequentially and skips work for rows that your query can't return. Which parts of a `WHERE` clause are pushed into the scan (and therefore avoid constructing geometry or emitting rows) is limited to the following:
+
+- `kind` and `type`: `=`, `IN (...)`, and `OR` of those on the same column
+- `id`: `=`, `IN (...)`, and `OR` of those
+- tags: `tags['key'] IS NOT NULL`, `tags['key'] = 'value'`, `tags['key'] IN ('a', 'b')`, and `OR` groups of these
+- tag count: comparisons of `cardinality(tags)` with a non-negative integer, such as `cardinality(tags) > 0`
+
+Multiple pushed-down predicates are ANDed together. Any other predicate is still applied correctly, but by DuckDB after rows are produced.
+
+**Spatial predicates are not pushed down.** A filter like `ST_Intersects(geometry, ...)` or a bounding-box test is evaluated after the geometry has been built, so it does not make the scan cheaper. OSM PBF files have no spatial index, so the whole file is still read. If you only need a small area, extract it first with a tool like [osmium extract](https://osmcode.org/osmium-tool/manual.html#creating-geographic-extracts).
+
+Projection pushdown works per column: if you don't select `geometry`, no geometry is built, and the same goes for the metadata columns (`version`, `timestamp`, `changeset`, `uid`, `username`) and the `refs`, `ref_roles` and `ref_types` columns.
+
+### Node location index
+
+Ways have no coordinates of their own, only the IDs of their nodes. To build a LineString or Polygon, the extension needs a lookup from node ID to location. It builds this index with one extra pass over the nodes in the file the first time a query needs it. Queries that read only nodes or non-area relations, or that don't select `geometry`, do not need it.
+
+The index is cached for the lifetime of the database, keyed on the file path, size, modification time and index settings, so later queries on the same file reuse it. It is rebuilt if the file changes.
+
+For in-memory index types, the index counts towards DuckDB's `memory_limit`, and DuckDB may evict it to make room (it is then rebuilt on the next query). File-backed index types don't count towards `memory_limit`.
+
+Two settings control the index:
+
+```sql
+-- Index implementation. Any index type supported by libosmium can be used,
+-- for example flex_mem (the default), sparse_mem_array, or sparse_file_array.
+SET osmium_index_type = 'sparse_file_array';
+
+-- File to use for file-backed index types (dense_file_array, sparse_file_array).
+SET osmium_index_path = '/path/to/node-index.tmp';
+```
+
+The right choice depends on the size of your file and how much memory you have. Memory-backed indexes are faster; file-backed ones let you read very large files (such as a full planet extract) without holding the index in RAM. See the [libosmium](https://osmcode.org/libosmium) documentation on node location indexes for how the types trade off.
+
+**Be careful with the `dense_*` types on small files.** A dense index is sized by the highest node ID it has to cover, not by the number of nodes in the file, and current OSM node IDs are in the billions. In testing, `dense_file_array` created a ~31 GB (sparse) file when reading a file with under 2,000 elements, and `dense_mem_array` got the process killed. Dense indexes only make sense for very large extracts. The default `flex_mem` switches between sparse and dense storage on its own and is a good starting point.
+
+## How geometries are built
+
+- **Nodes** become `Point`s.
+- **Open ways** become `LineString`s, using locations from the node index.
+- **Closed ways** that aren't tagged `area=no` can also be built as `Polygon`s (see the previous section for why these are emitted twice).
+- **Relations with `type=multipolygon` or `type=boundary`** become `kind = 'area'` rows with a `Polygon` or `MultiPolygon` geometry. These are assembled by libosmium's area assembler using its default settings, which joins the member ways' segments into outer and inner rings. The extension reads the relations first to find which member ways it needs, then assembles each relation as its member ways are read from the file.
+
+Elements whose geometry can't be built are not dropped. They are returned with a NULL `geometry`, and their tags and metadata are still populated. This happens when:
+
+- a way refers to a node that is missing from the file (common in extracts that cut ways at the boundary)
+- a multipolygon or boundary relation refers to a member way that is missing from the file
+- a multipolygon or boundary relation has no way members, or its ways can't be joined into valid rings
+
+You can find them with `WHERE geometry IS NULL`, or exclude them with `geometry IS NOT NULL`. The `test/sql/incomplete.test` file shows these cases against a small fixture.
+
 ## License
 
 This code is available under the MIT License; see the LICENSE file for details.
