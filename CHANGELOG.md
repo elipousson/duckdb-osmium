@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Added support for DuckDB v2.0.0. This required porting the filter pushdown
+  and vector-writing code to the 2.0 C++ API, so this build is no longer
+  compatible with DuckDB v1.5.x.
+
 ## v0.5.2
 
 Released 2026-08-14.

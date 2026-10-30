@@ -8,6 +8,10 @@
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/geometry.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
+#include "duckdb/common/vector/map_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
@@ -412,7 +416,7 @@ struct CachedNodeIndex : public duckdb::ObjectCacheEntry {
 		osmium::io::Reader reader {pbf_path, osmium::osm_entity_bits::node, osmium::io::read_meta::no};
 		location_handler_type handler {*index};
 		while (osmium::memory::Buffer buffer = reader.read()) {
-			if (context.interrupted) {
+			if (context.IsInterrupted()) {
 				throw duckdb::InterruptException();
 			}
 
@@ -503,7 +507,7 @@ struct OsmBindData : public duckdb::TableFunctionData {
 // the function arguments, which will produce wrong results when predicate
 // pushdown is implemented.
 static void OsmSerialize(duckdb::Serializer &serializer, const duckdb::optional_ptr<duckdb::FunctionData> bind_data_p,
-                         const duckdb::TableFunction &) {
+                         const duckdb::BoundTableFunction &) {
 	auto &bind_data = bind_data_p->Cast<OsmBindData>();
 
 	duckdb::vector<duckdb::vector<TagPredicate>> groups;
@@ -532,7 +536,7 @@ static void OsmSerialize(duckdb::Serializer &serializer, const duckdb::optional_
 }
 
 static duckdb::unique_ptr<duckdb::FunctionData> OsmDeserialize(duckdb::Deserializer &deserializer,
-                                                               duckdb::TableFunction &) {
+                                                               duckdb::BoundTableFunction &) {
 	auto bind_data = duckdb::make_uniq<OsmBindData>();
 	bind_data->file_path = deserializer.ReadProperty<std::string>(100, "file_path");
 	bind_data->kind_filter.nodes = deserializer.ReadProperty<bool>(101, "kind_nodes");
@@ -922,7 +926,7 @@ static void ProcessBuffer(OsmGlobalState &state, osmium::memory::Buffer &buffer)
 static duckdb::unique_ptr<duckdb::FunctionData> OsmBind(duckdb::ClientContext &context,
                                                         duckdb::TableFunctionBindInput &input,
                                                         duckdb::vector<duckdb::LogicalType> &return_types,
-                                                        duckdb::vector<duckdb::string> &names) {
+                                                        duckdb::vector<duckdb::Identifier> &names) {
 	auto bind_data = duckdb::make_uniq<OsmBindData>();
 	bind_data->file_path = input.inputs[0].GetValue<std::string>();
 
@@ -972,11 +976,11 @@ static duckdb::unique_ptr<duckdb::FunctionData> OsmBind(duckdb::ClientContext &c
 // Returns INVALID_INDEX if the binding doesn't refer to our table.
 static idx_t ResolveSchemaColumn(const duckdb::LogicalGet &get, idx_t table_index,
                                  const duckdb::ColumnBinding &binding) {
-	if (binding.table_index != table_index) {
+	if (binding.table_index.index != table_index) {
 		return duckdb::DConstants::INVALID_INDEX;
 	}
 	auto &column_ids = get.GetColumnIds();
-	auto proj_idx = binding.column_index;
+	auto proj_idx = binding.column_index.GetIndexUnsafe();
 	if (proj_idx >= column_ids.size()) {
 		return duckdb::DConstants::INVALID_INDEX;
 	}
@@ -996,55 +1000,60 @@ static bool TryExtractColumnConstants(const duckdb::Expression &expr, const duck
                                       idx_t &schema_idx, std::vector<duckdb::Value> &values) {
 	switch (expr.GetExpressionType()) {
 	case duckdb::ExpressionType::COMPARE_EQUAL: {
-		auto &comp = expr.Cast<duckdb::BoundComparisonExpression>();
+		if (expr.GetExpressionClass() != duckdb::ExpressionClass::BOUND_FUNCTION) {
+			return false;
+		}
+		auto &comp = expr.Cast<duckdb::BoundFunctionExpression>();
+		auto &left = duckdb::BoundComparisonExpression::Left(comp);
+		auto &right = duckdb::BoundComparisonExpression::Right(comp);
 
 		const duckdb::BoundColumnRefExpression *col = nullptr;
 		const duckdb::BoundConstantExpression *val = nullptr;
-		if (comp.left->GetExpressionClass() == duckdb::ExpressionClass::BOUND_COLUMN_REF &&
-		    comp.right->GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT) {
-			col = &comp.left->Cast<duckdb::BoundColumnRefExpression>();
-			val = &comp.right->Cast<duckdb::BoundConstantExpression>();
-		} else if (comp.right->GetExpressionClass() == duckdb::ExpressionClass::BOUND_COLUMN_REF &&
-		           comp.left->GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT) {
-			col = &comp.right->Cast<duckdb::BoundColumnRefExpression>();
-			val = &comp.left->Cast<duckdb::BoundConstantExpression>();
+		if (left.GetExpressionClass() == duckdb::ExpressionClass::BOUND_COLUMN_REF &&
+		    right.GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT) {
+			col = &left.Cast<duckdb::BoundColumnRefExpression>();
+			val = &right.Cast<duckdb::BoundConstantExpression>();
+		} else if (right.GetExpressionClass() == duckdb::ExpressionClass::BOUND_COLUMN_REF &&
+		           left.GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT) {
+			col = &right.Cast<duckdb::BoundColumnRefExpression>();
+			val = &left.Cast<duckdb::BoundConstantExpression>();
 		}
-		if (!col || !val || val->value.IsNull()) {
+		if (!col || !val || val->GetValue().IsNull()) {
 			return false;
 		}
 
-		auto idx = ResolveSchemaColumn(get, table_index, col->binding);
+		auto idx = ResolveSchemaColumn(get, table_index, col->Binding());
 		if (idx == duckdb::DConstants::INVALID_INDEX) {
 			return false;
 		}
 		schema_idx = idx;
-		values = {val->value};
+		values = {val->GetValue()};
 		return true;
 	}
 	case duckdb::ExpressionType::COMPARE_IN: {
 		auto &op = expr.Cast<duckdb::BoundOperatorExpression>();
-		if (op.children.size() < 2) {
+		if (op.GetChildren().size() < 2) {
 			return false;
 		}
-		if (op.children[0]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_COLUMN_REF) {
+		if (op.GetChildren()[0]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_COLUMN_REF) {
 			return false;
 		}
-		auto &col = op.children[0]->Cast<duckdb::BoundColumnRefExpression>();
-		auto idx = ResolveSchemaColumn(get, table_index, col.binding);
+		auto &col = op.GetChildren()[0]->Cast<duckdb::BoundColumnRefExpression>();
+		auto idx = ResolveSchemaColumn(get, table_index, col.Binding());
 		if (idx == duckdb::DConstants::INVALID_INDEX) {
 			return false;
 		}
 
 		std::vector<duckdb::Value> result;
-		for (idx_t i = 1; i < op.children.size(); i++) {
-			if (op.children[i]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
+		for (idx_t i = 1; i < op.GetChildren().size(); i++) {
+			if (op.GetChildren()[i]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
 				return false;
 			}
-			auto &c = op.children[i]->Cast<duckdb::BoundConstantExpression>();
-			if (c.value.IsNull()) {
+			auto &c = op.GetChildren()[i]->Cast<duckdb::BoundConstantExpression>();
+			if (c.GetValue().IsNull()) {
 				return false;
 			}
-			result.push_back(c.value);
+			result.push_back(c.GetValue());
 		}
 
 		schema_idx = idx;
@@ -1056,7 +1065,7 @@ static bool TryExtractColumnConstants(const duckdb::Expression &expr, const duck
 
 		auto common_idx = duckdb::DConstants::INVALID_INDEX;
 		std::vector<duckdb::Value> result;
-		for (const auto &child : conj.children) {
+		for (const auto &child : conj.GetChildren()) {
 			auto child_idx = duckdb::DConstants::INVALID_INDEX;
 			std::vector<duckdb::Value> child_values;
 			if (!TryExtractColumnConstants(*child, get, table_index, child_idx, child_values)) {
@@ -1138,11 +1147,11 @@ static bool ValuesToIds(const std::vector<duckdb::Value> &values, std::unordered
 		if (!value.type().IsIntegral()) {
 			return false;
 		}
-		duckdb::Value id;
-		if (!value.DefaultTryCastAs(duckdb::LogicalType::BIGINT, id, nullptr) || id.IsNull()) {
+		auto id = value.DefaultTryCastAs(duckdb::LogicalType::BIGINT);
+		if (!id || id->IsNull()) {
 			return false;
 		}
-		result.insert(id.GetValue<int64_t>());
+		result.insert(id->GetValue<int64_t>());
 	}
 	out = std::move(result);
 	return true;
@@ -1155,34 +1164,34 @@ static std::string TryExtractMapKey(const duckdb::Expression &expr, const duckdb
 		return "";
 	}
 	auto &func = expr.Cast<duckdb::BoundFunctionExpression>();
-	if (func.function.name != "map_extract_value") {
+	if (func.Function().GetName() != "map_extract_value") {
 		return "";
 	}
-	if (func.children.size() != 2) {
+	if (func.GetChildren().size() != 2) {
 		return "";
 	}
 
 	// First child should be a column ref to the tags column
-	auto &first = *func.children[0];
+	auto &first = *func.GetChildren()[0];
 	if (first.GetExpressionClass() != duckdb::ExpressionClass::BOUND_COLUMN_REF) {
 		return "";
 	}
 	auto &col = first.Cast<duckdb::BoundColumnRefExpression>();
-	auto schema_idx = ResolveSchemaColumn(get, table_index, col.binding);
+	auto schema_idx = ResolveSchemaColumn(get, table_index, col.Binding());
 	if (schema_idx != COL_TAGS) {
 		return "";
 	}
 
 	// Second child should be a string constant (the key)
-	auto &second = *func.children[1];
+	auto &second = *func.GetChildren()[1];
 	if (second.GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
 		return "";
 	}
 	auto &key_const = second.Cast<duckdb::BoundConstantExpression>();
-	if (key_const.value.type().id() != duckdb::LogicalTypeId::VARCHAR) {
+	if (key_const.GetValue().type().id() != duckdb::LogicalTypeId::VARCHAR) {
 		return "";
 	}
-	return key_const.value.GetValue<std::string>();
+	return key_const.GetValue().GetValue<std::string>();
 }
 
 // Try to extract a tag predicate from:
@@ -1194,10 +1203,10 @@ static bool TryExtractTagPredicate(const duckdb::Expression &expr, const duckdb:
 	// Case 1: IS NOT NULL(map_extract_value(tags, 'key'))
 	if (expr.GetExpressionType() == duckdb::ExpressionType::OPERATOR_IS_NOT_NULL) {
 		auto &op = expr.Cast<duckdb::BoundOperatorExpression>();
-		if (op.children.size() != 1) {
+		if (op.GetChildren().size() != 1) {
 			return false;
 		}
-		auto key = TryExtractMapKey(*op.children[0], get, table_index);
+		auto key = TryExtractMapKey(*op.GetChildren()[0], get, table_index);
 		if (key.empty()) {
 			return false;
 		}
@@ -1208,19 +1217,24 @@ static bool TryExtractTagPredicate(const duckdb::Expression &expr, const duckdb:
 	// Case 2: COMPARE_EQUAL(map_extract_value(tags, 'key'), constant)
 	//      or COMPARE_EQUAL(constant, map_extract_value(tags, 'key'))
 	if (expr.GetExpressionType() == duckdb::ExpressionType::COMPARE_EQUAL) {
-		auto &comp = expr.Cast<duckdb::BoundComparisonExpression>();
+		if (expr.GetExpressionClass() != duckdb::ExpressionClass::BOUND_FUNCTION) {
+			return false;
+		}
+		auto &comp = expr.Cast<duckdb::BoundFunctionExpression>();
+		auto &left = duckdb::BoundComparisonExpression::Left(comp);
+		auto &right = duckdb::BoundComparisonExpression::Right(comp);
 
 		const duckdb::Expression *map_expr = nullptr;
 		const duckdb::Expression *val_expr = nullptr;
 
-		if (comp.left->GetExpressionClass() == duckdb::ExpressionClass::BOUND_FUNCTION &&
-		    comp.right->GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT) {
-			map_expr = comp.left.get();
-			val_expr = comp.right.get();
-		} else if (comp.right->GetExpressionClass() == duckdb::ExpressionClass::BOUND_FUNCTION &&
-		           comp.left->GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT) {
-			map_expr = comp.right.get();
-			val_expr = comp.left.get();
+		if (left.GetExpressionClass() == duckdb::ExpressionClass::BOUND_FUNCTION &&
+		    right.GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT) {
+			map_expr = &left;
+			val_expr = &right;
+		} else if (right.GetExpressionClass() == duckdb::ExpressionClass::BOUND_FUNCTION &&
+		           left.GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT) {
+			map_expr = &right;
+			val_expr = &left;
 		}
 		if (!map_expr || !val_expr) {
 			return false;
@@ -1232,37 +1246,37 @@ static bool TryExtractTagPredicate(const duckdb::Expression &expr, const duckdb:
 		}
 
 		auto &val_const = val_expr->Cast<duckdb::BoundConstantExpression>();
-		if (val_const.value.type().id() != duckdb::LogicalTypeId::VARCHAR) {
+		if (val_const.GetValue().type().id() != duckdb::LogicalTypeId::VARCHAR) {
 			return false;
 		}
 
 		out.key = std::move(key);
-		out.values = {val_const.value.GetValue<std::string>()};
+		out.values = {val_const.GetValue().GetValue<std::string>()};
 		return true;
 	}
 
 	// Case 3: COMPARE_IN(map_extract_value(tags, 'key'), 'v1', 'v2', ...)
 	if (expr.GetExpressionType() == duckdb::ExpressionType::COMPARE_IN) {
 		auto &op = expr.Cast<duckdb::BoundOperatorExpression>();
-		if (op.children.size() < 2) {
+		if (op.GetChildren().size() < 2) {
 			return false;
 		}
 
-		auto key = TryExtractMapKey(*op.children[0], get, table_index);
+		auto key = TryExtractMapKey(*op.GetChildren()[0], get, table_index);
 		if (key.empty()) {
 			return false;
 		}
 
 		std::unordered_set<std::string> vals;
-		for (idx_t i = 1; i < op.children.size(); i++) {
-			if (op.children[i]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
+		for (idx_t i = 1; i < op.GetChildren().size(); i++) {
+			if (op.GetChildren()[i]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
 				return false;
 			}
-			auto &c = op.children[i]->Cast<duckdb::BoundConstantExpression>();
-			if (c.value.type().id() != duckdb::LogicalTypeId::VARCHAR) {
+			auto &c = op.GetChildren()[i]->Cast<duckdb::BoundConstantExpression>();
+			if (c.GetValue().type().id() != duckdb::LogicalTypeId::VARCHAR) {
 				return false;
 			}
-			vals.insert(c.value.GetValue<std::string>());
+			vals.insert(c.GetValue().GetValue<std::string>());
 		}
 
 		out.key = std::move(key);
@@ -1283,7 +1297,7 @@ static bool TryExtractTagPredicateOr(const duckdb::Expression &expr, const duckd
 	auto &conj = expr.Cast<duckdb::BoundConjunctionExpression>();
 
 	std::vector<TagPredicate> result;
-	for (const auto &child : conj.children) {
+	for (const auto &child : conj.GetChildren()) {
 		TagPredicate pred;
 		if (!TryExtractTagPredicate(*child, get, table_index, pred)) {
 			return false;
@@ -1299,8 +1313,8 @@ static bool TryExtractTagPredicateOr(const duckdb::Expression &expr, const duckd
 // against an integer literal can leave a cast on either side of the expr.
 static const duckdb::Expression &UnwrapCasts(const duckdb::Expression &expr) {
 	const duckdb::Expression *result = &expr;
-	while (result->GetExpressionClass() == duckdb::ExpressionClass::BOUND_CAST) {
-		result = result->Cast<duckdb::BoundCastExpression>().child.get();
+	while (duckdb::BoundCastExpression::IsCast(*result)) {
+		result = &duckdb::BoundCastExpression::Child(result->Cast<duckdb::BoundFunctionExpression>());
 	}
 	return *result;
 }
@@ -1329,15 +1343,15 @@ static bool IsTagCardinality(const duckdb::Expression &expr, const duckdb::Logic
 		return false;
 	}
 	auto &func = unwrapped.Cast<duckdb::BoundFunctionExpression>();
-	if (func.function.name != "cardinality" || func.children.size() != 1) {
+	if (func.Function().GetName() != "cardinality" || func.GetChildren().size() != 1) {
 		return false;
 	}
-	auto &arg = UnwrapCasts(*func.children[0]);
+	auto &arg = UnwrapCasts(*func.GetChildren()[0]);
 	if (arg.GetExpressionClass() != duckdb::ExpressionClass::BOUND_COLUMN_REF) {
 		return false;
 	}
 	auto &col = arg.Cast<duckdb::BoundColumnRefExpression>();
-	return ResolveSchemaColumn(get, table_index, col.binding) == COL_TAGS;
+	return ResolveSchemaColumn(get, table_index, col.Binding()) == COL_TAGS;
 }
 
 // Try to extract a bound on the number of tags from `cardinality(tags) <op> n`.
@@ -1345,19 +1359,21 @@ static bool IsTagCardinality(const duckdb::Expression &expr, const duckdb::Logic
 // for DuckDB to handle with post-filtering (which is slower but still correct).
 static bool TryExtractTagCount(const duckdb::Expression &expr, const duckdb::LogicalGet &get, idx_t table_index,
                                TagCountFilter &out) {
-	if (expr.GetExpressionClass() != duckdb::ExpressionClass::BOUND_COMPARISON) {
+	if (!duckdb::BoundComparisonExpression::IsComparison(expr)) {
 		return false;
 	}
-	auto &comp = expr.Cast<duckdb::BoundComparisonExpression>();
+	auto &comp = expr.Cast<duckdb::BoundFunctionExpression>();
+	auto &left = duckdb::BoundComparisonExpression::Left(comp);
+	auto &right = duckdb::BoundComparisonExpression::Right(comp);
 
 	// Normalize to `cardinality(tags) <op> constant`, flipping the comparison
 	// if the query was written the other way around.
 	auto type = expr.GetExpressionType();
 	const duckdb::Expression *const_expr = nullptr;
-	if (IsTagCardinality(*comp.left, get, table_index)) {
-		const_expr = comp.right.get();
-	} else if (IsTagCardinality(*comp.right, get, table_index)) {
-		const_expr = comp.left.get();
+	if (IsTagCardinality(left, get, table_index)) {
+		const_expr = &right;
+	} else if (IsTagCardinality(right, get, table_index)) {
+		const_expr = &left;
 		type = FlipComparison(type);
 	} else {
 		return false;
@@ -1367,16 +1383,16 @@ static bool TryExtractTagCount(const duckdb::Expression &expr, const duckdb::Log
 	if (unwrapped.GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
 		return false;
 	}
-	auto &value = unwrapped.Cast<duckdb::BoundConstantExpression>().value;
+	auto &value = unwrapped.Cast<duckdb::BoundConstantExpression>().GetValue();
 	if (value.IsNull() || !value.type().IsIntegral()) {
 		return false;
 	}
 
-	duckdb::Value as_bigint;
-	if (!value.DefaultTryCastAs(duckdb::LogicalType::BIGINT, as_bigint, nullptr)) {
+	auto as_bigint = value.DefaultTryCastAs(duckdb::LogicalType::BIGINT);
+	if (!as_bigint) {
 		return false;
 	}
-	const auto n = duckdb::BigIntValue::Get(as_bigint);
+	const auto n = duckdb::BigIntValue::Get(*as_bigint);
 	if (n < 0) {
 		return false;
 	}
@@ -1428,7 +1444,7 @@ static void OsmComplexFilterPushdown(duckdb::ClientContext &context, duckdb::Log
 		{
 			auto schema_idx = duckdb::DConstants::INVALID_INDEX;
 			std::vector<duckdb::Value> values;
-			if (TryExtractColumnConstants(*filters[i], get, get.table_index, schema_idx, values)) {
+			if (TryExtractColumnConstants(*filters[i], get, get.table_index.index, schema_idx, values)) {
 				if (schema_idx == COL_KIND) {
 					KindFilter kf;
 					if (ValuesToKindFilter(values, kf)) {
@@ -1454,7 +1470,7 @@ static void OsmComplexFilterPushdown(duckdb::ClientContext &context, duckdb::Log
 		// Try single tag predicate pushdown (becomes a group of size 1)
 		if (!consumed) {
 			TagPredicate pred;
-			if (TryExtractTagPredicate(*filters[i], get, get.table_index, pred)) {
+			if (TryExtractTagPredicate(*filters[i], get, get.table_index.index, pred)) {
 				bind_data.tag_predicates.push_back({std::move(pred)});
 				consumed = true;
 			}
@@ -1463,7 +1479,7 @@ static void OsmComplexFilterPushdown(duckdb::ClientContext &context, duckdb::Log
 		// Try OR of tag predicates pushdown (becomes a disjunctive group)
 		if (!consumed) {
 			std::vector<TagPredicate> group;
-			if (TryExtractTagPredicateOr(*filters[i], get, get.table_index, group)) {
+			if (TryExtractTagPredicateOr(*filters[i], get, get.table_index.index, group)) {
 				bind_data.tag_predicates.push_back(std::move(group));
 				consumed = true;
 			}
@@ -1472,7 +1488,7 @@ static void OsmComplexFilterPushdown(duckdb::ClientContext &context, duckdb::Log
 		// Try tag count pushdown. Repeated predicates narrow the range.
 		if (!consumed) {
 			TagCountFilter tcf;
-			if (TryExtractTagCount(*filters[i], get, get.table_index, tcf)) {
+			if (TryExtractTagCount(*filters[i], get, get.table_index.index, tcf)) {
 				bind_data.tag_count_filter &= tcf;
 				consumed = true;
 			}
@@ -1553,7 +1569,7 @@ static duckdb::unique_ptr<duckdb::GlobalTableFunctionState> OsmInitGlobal(duckdb
 		// so the selective resolver knows which ways need locations.
 		osmium::io::Reader rel_reader {bind_data.file_path, osmium::osm_entity_bits::relation, read_metadata};
 		while (osmium::memory::Buffer buffer = rel_reader.read()) {
-			if (context.interrupted) {
+			if (context.IsInterrupted()) {
 				throw duckdb::InterruptException();
 			}
 
@@ -1593,7 +1609,7 @@ static void OsmScan(duckdb::ClientContext &context, duckdb::TableFunctionInput &
 	auto &state = data.global_state->Cast<OsmGlobalState>();
 
 	if (state.exhausted && state.batch_offset >= state.current_batch.size()) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 
@@ -1629,7 +1645,7 @@ static void OsmScan(duckdb::ClientContext &context, duckdb::TableFunctionInput &
 				break;
 			}
 
-			if (context.interrupted) {
+			if (context.IsInterrupted()) {
 				throw duckdb::InterruptException();
 			}
 
@@ -1662,18 +1678,18 @@ static void OsmScan(duckdb::ClientContext &context, duckdb::TableFunctionInput &
 
 			if (kind_out >= 0) {
 				auto &vec = output.data[kind_out];
-				duckdb::FlatVector::GetData<duckdb::string_t>(vec)[count] =
+				duckdb::FlatVector::GetDataMutable<duckdb::string_t>(vec)[count] =
 				    duckdb::StringVector::AddString(vec, KIND_NAMES[row.kind]);
 			}
 
 			if (type_out >= 0) {
 				auto &vec = output.data[type_out];
-				duckdb::FlatVector::GetData<duckdb::string_t>(vec)[count] =
+				duckdb::FlatVector::GetDataMutable<duckdb::string_t>(vec)[count] =
 				    duckdb::StringVector::AddString(vec, TYPE_NAMES[row.type]);
 			}
 
 			if (id_out >= 0) {
-				duckdb::FlatVector::GetData<int64_t>(output.data[id_out])[count] = row.id;
+				duckdb::FlatVector::GetDataMutable<int64_t>(output.data[id_out])[count] = row.id;
 			}
 
 			if (tags_out >= 0) {
@@ -1683,13 +1699,13 @@ static void OsmScan(duckdb::ClientContext &context, duckdb::TableFunctionInput &
 
 				idx_t num_tags = row.tags.size();
 				duckdb::ListVector::Reserve(tags_vec, tags_offset + num_tags);
-				auto tags_list_data = duckdb::ListVector::GetData(tags_vec);
+				auto tags_list_data = duckdb::FlatVector::GetDataMutable<duckdb::list_entry_t>(tags_vec);
 				tags_list_data[count].offset = tags_offset;
 				tags_list_data[count].length = num_tags;
 				for (idx_t i = 0; i < num_tags; i++) {
-					duckdb::FlatVector::GetData<duckdb::string_t>(tags_keys)[tags_offset + i] =
+					duckdb::FlatVector::GetDataMutable<duckdb::string_t>(tags_keys)[tags_offset + i] =
 					    duckdb::StringVector::AddString(tags_keys, row.tags[i].first);
-					duckdb::FlatVector::GetData<duckdb::string_t>(tags_values)[tags_offset + i] =
+					duckdb::FlatVector::GetDataMutable<duckdb::string_t>(tags_values)[tags_offset + i] =
 					    duckdb::StringVector::AddString(tags_values, row.tags[i].second);
 				}
 				tags_offset += num_tags;
@@ -1707,8 +1723,8 @@ static void OsmScan(duckdb::ClientContext &context, duckdb::TableFunctionInput &
 					// the data into vec's string heap.
 					duckdb::string_t wkb(row.geometry.data(), row.geometry.size());
 					duckdb::string_t geom;
-					duckdb::Geometry::FromBinary(wkb, geom, vec, true);
-					duckdb::FlatVector::GetData<duckdb::string_t>(vec)[count] = geom;
+					duckdb::Geometry::FromBinary(wkb, geom, duckdb::StringVector::GetStringHeap(vec), true);
+					duckdb::FlatVector::GetDataMutable<duckdb::string_t>(vec)[count] = geom;
 				}
 			}
 
@@ -1717,7 +1733,7 @@ static void OsmScan(duckdb::ClientContext &context, duckdb::TableFunctionInput &
 				if (row.version == 0) {
 					duckdb::FlatVector::SetNull(vec, count, true);
 				} else {
-					duckdb::FlatVector::GetData<uint32_t>(vec)[count] = row.version;
+					duckdb::FlatVector::GetDataMutable<uint32_t>(vec)[count] = row.version;
 				}
 			}
 
@@ -1726,7 +1742,7 @@ static void OsmScan(duckdb::ClientContext &context, duckdb::TableFunctionInput &
 				if (row.timestamp_seconds == 0) {
 					duckdb::FlatVector::SetNull(vec, count, true);
 				} else {
-					duckdb::FlatVector::GetData<duckdb::timestamp_t>(vec)[count] =
+					duckdb::FlatVector::GetDataMutable<duckdb::timestamp_t>(vec)[count] =
 					    duckdb::timestamp_t(row.timestamp_seconds * 1000000LL);
 				}
 			}
@@ -1736,7 +1752,7 @@ static void OsmScan(duckdb::ClientContext &context, duckdb::TableFunctionInput &
 				if (row.changeset == 0) {
 					duckdb::FlatVector::SetNull(vec, count, true);
 				} else {
-					duckdb::FlatVector::GetData<uint32_t>(vec)[count] = row.changeset;
+					duckdb::FlatVector::GetDataMutable<uint32_t>(vec)[count] = row.changeset;
 				}
 			}
 
@@ -1745,7 +1761,7 @@ static void OsmScan(duckdb::ClientContext &context, duckdb::TableFunctionInput &
 				if (row.uid == 0) {
 					duckdb::FlatVector::SetNull(vec, count, true);
 				} else {
-					duckdb::FlatVector::GetData<uint32_t>(vec)[count] = row.uid;
+					duckdb::FlatVector::GetDataMutable<uint32_t>(vec)[count] = row.uid;
 				}
 			}
 
@@ -1754,7 +1770,7 @@ static void OsmScan(duckdb::ClientContext &context, duckdb::TableFunctionInput &
 				if (row.username.empty()) {
 					duckdb::FlatVector::SetNull(vec, count, true);
 				} else {
-					duckdb::FlatVector::GetData<duckdb::string_t>(vec)[count] =
+					duckdb::FlatVector::GetDataMutable<duckdb::string_t>(vec)[count] =
 					    duckdb::StringVector::AddString(vec, row.username);
 				}
 			}
@@ -1764,13 +1780,13 @@ static void OsmScan(duckdb::ClientContext &context, duckdb::TableFunctionInput &
 				if (row.kind != KIND_RELATION) {
 					duckdb::FlatVector::SetNull(vec, count, true);
 				} else {
-					auto &refs_child = duckdb::ListVector::GetEntry(vec);
+					auto &refs_child = duckdb::ListVector::GetChildMutable(vec);
 					idx_t num_refs = row.refs.size();
 					duckdb::ListVector::Reserve(vec, refs_offset + num_refs);
-					auto refs_list_data = duckdb::ListVector::GetData(vec);
+					auto refs_list_data = duckdb::FlatVector::GetDataMutable<duckdb::list_entry_t>(vec);
 					refs_list_data[count].offset = refs_offset;
 					refs_list_data[count].length = num_refs;
-					auto refs_data = duckdb::FlatVector::GetData<int64_t>(refs_child);
+					auto refs_data = duckdb::FlatVector::GetDataMutable<int64_t>(refs_child);
 					for (idx_t i = 0; i < num_refs; i++) {
 						refs_data[refs_offset + i] = row.refs[i];
 					}
@@ -1784,14 +1800,14 @@ static void OsmScan(duckdb::ClientContext &context, duckdb::TableFunctionInput &
 				if (row.kind != KIND_RELATION) {
 					duckdb::FlatVector::SetNull(vec, count, true);
 				} else {
-					auto &child = duckdb::ListVector::GetEntry(vec);
+					auto &child = duckdb::ListVector::GetChildMutable(vec);
 					idx_t num = row.ref_roles.size();
 					duckdb::ListVector::Reserve(vec, ref_roles_offset + num);
-					auto list_data = duckdb::ListVector::GetData(vec);
+					auto list_data = duckdb::FlatVector::GetDataMutable<duckdb::list_entry_t>(vec);
 					list_data[count].offset = ref_roles_offset;
 					list_data[count].length = num;
 					for (idx_t i = 0; i < num; i++) {
-						duckdb::FlatVector::GetData<duckdb::string_t>(child)[ref_roles_offset + i] =
+						duckdb::FlatVector::GetDataMutable<duckdb::string_t>(child)[ref_roles_offset + i] =
 						    duckdb::StringVector::AddString(child, row.ref_roles[i]);
 					}
 					ref_roles_offset += num;
@@ -1804,14 +1820,14 @@ static void OsmScan(duckdb::ClientContext &context, duckdb::TableFunctionInput &
 				if (row.kind != KIND_RELATION) {
 					duckdb::FlatVector::SetNull(vec, count, true);
 				} else {
-					auto &child = duckdb::ListVector::GetEntry(vec);
+					auto &child = duckdb::ListVector::GetChildMutable(vec);
 					idx_t num = row.ref_types.size();
 					duckdb::ListVector::Reserve(vec, ref_types_offset + num);
-					auto list_data = duckdb::ListVector::GetData(vec);
+					auto list_data = duckdb::FlatVector::GetDataMutable<duckdb::list_entry_t>(vec);
 					list_data[count].offset = ref_types_offset;
 					list_data[count].length = num;
 					for (idx_t i = 0; i < num; i++) {
-						duckdb::FlatVector::GetData<duckdb::string_t>(child)[ref_types_offset + i] =
+						duckdb::FlatVector::GetDataMutable<duckdb::string_t>(child)[ref_types_offset + i] =
 						    duckdb::StringVector::AddString(child, TYPE_NAMES[row.ref_types[i]]);
 					}
 					ref_types_offset += num;
@@ -1823,7 +1839,7 @@ static void OsmScan(duckdb::ClientContext &context, duckdb::TableFunctionInput &
 		}
 	}
 
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 static duckdb::TableFunction GetOsmScanFunction() {
@@ -1845,11 +1861,11 @@ static duckdb::unique_ptr<duckdb::TableRef> OsmReplacementScan(duckdb::ClientCon
 
 	auto table_function = duckdb::make_uniq<duckdb::TableFunctionRef>();
 	duckdb::vector<duckdb::unique_ptr<duckdb::ParsedExpression>> children;
-	children.push_back(duckdb::make_uniq<duckdb::ConstantExpression>(duckdb::Value(table_name)));
+	children.push_back(duckdb::make_uniq<duckdb::ConstantExpression>(duckdb::Literal::String(table_name)));
 	table_function->function = duckdb::make_uniq<duckdb::FunctionExpression>("osmium_read", std::move(children));
 
 	auto &fs = duckdb::FileSystem::GetFileSystem(context);
-	table_function->alias = fs.ExtractBaseName(table_name);
+	table_function->alias = duckdb::Identifier(fs.ExtractBaseName(table_name));
 
 	return table_function;
 }
