@@ -21,21 +21,21 @@ find_package(EXPAT REQUIRED)
 # Threading (required by libosmium for parallel PBF block decompression)
 find_package(Threads REQUIRED)
 
-set(EXTENSION_SOURCES
-    src/osmium_extension.cpp)
+set(EXTENSION_SOURCES src/osmium_extension.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
 foreach(EXT_TARGET ${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME})
-    set_target_properties(${EXT_TARGET} PROPERTIES CXX_STANDARD 14)
-    target_include_directories(${EXT_TARGET} SYSTEM PRIVATE
-        ${LIBOSMIUM_INCLUDE_DIR}
-        ${PROTOZERO_INCLUDE_DIR})
-    target_link_libraries(${EXT_TARGET} ZLIB::ZLIB EXPAT::EXPAT Threads::Threads)
-    # add NOMINMAX on Windows to prevent windows.h from defining macros that
-    # conflict with stdlib function names.
-    target_compile_definitions(${EXT_TARGET} PRIVATE $<$<PLATFORM_ID:Windows>:NOMINMAX>)
+  set_target_properties(${EXT_TARGET} PROPERTIES CXX_STANDARD 14)
+  target_include_directories(
+    ${EXT_TARGET} SYSTEM PRIVATE ${LIBOSMIUM_INCLUDE_DIR}
+                                 ${PROTOZERO_INCLUDE_DIR})
+  target_link_libraries(${EXT_TARGET} ZLIB::ZLIB EXPAT::EXPAT Threads::Threads)
+  # add NOMINMAX on Windows to prevent windows.h from defining macros that
+  # conflict with stdlib function names.
+  target_compile_definitions(${EXT_TARGET}
+                             PRIVATE $<$<PLATFORM_ID:Windows>:NOMINMAX>)
 endforeach()
 
 install(
